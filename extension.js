@@ -4,29 +4,49 @@ const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
 const { simpleGit } = require('simple-git');
-require('events').EventEmitter.defaultMaxListeners = 20; // or any value greater than 10
-
+require('events').EventEmitter.defaultMaxListeners = 20;
 
 let pushInterval;
+let fileWatcher;  // Add this to track the file watcher
 const CONFIG_FILE_NAME = '.autopush.json';
 
-// Function to add .autopush.json to .gitignore if not already present
-function addToGitIgnore(workspacePath) {
-    const gitIgnorePath = path.join(workspacePath, '.gitignore');
+async function checkAndInitializeWorkspace() {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) return;
+
+    const configPath = path.join(workspaceFolder.uri.fsPath, CONFIG_FILE_NAME);
     
-    if (fs.existsSync(gitIgnorePath)) {
-        const gitIgnoreContent = fs.readFileSync(gitIgnorePath, 'utf-8');
-        // Check if .autopush.json is already in .gitignore
-        if (!gitIgnoreContent.includes('.autopush.json')) {
-            fs.appendFileSync(gitIgnorePath, '\n.autopush.json\n');
-            vscode.window.showInformationMessage('.autopush.json has been added to .gitignore');
-        }
-    } else {
-        // If .gitignore doesn't exist, create it and add .autopush.json
-        const content = '.autopush.json\n';
-        fs.writeFileSync(gitIgnorePath, content);
-        vscode.window.showInformationMessage('.gitignore created and .autopush.json added');
+    if (fs.existsSync(configPath)) {
+        // Create a file watcher for the config file
+        setupFileWatcher(configPath, workspaceFolder.uri.fsPath);
+        // Start auto-push
+        await startAutoPush(configPath, workspaceFolder.uri.fsPath);
+        vscode.window.showInformationMessage('Auto-push initialized from existing configuration');
     }
+}
+
+function setupFileWatcher(configPath, workspacePath) {
+    // Dispose of existing watcher if any
+    if (fileWatcher) {
+        fileWatcher.dispose();
+    }
+
+    // Create new file watcher using VS Code API
+    fileWatcher = vscode.workspace.createFileSystemWatcher(configPath);
+    
+    fileWatcher.onDidChange(async () => {
+        console.log('Config file changed');
+        vscode.window.showInformationMessage('Auto-push config changed, restarting...');
+        await startAutoPush(configPath, workspacePath);
+    });
+
+    fileWatcher.onDidDelete(() => {
+        if (pushInterval) {
+            clearInterval(pushInterval);
+            pushInterval = null;
+        }
+        vscode.window.showInformationMessage('Auto-push config deleted, stopping auto-push');
+    });
 }
 
 async function initAutoPush() {
@@ -35,26 +55,25 @@ async function initAutoPush() {
         vscode.window.showErrorMessage('Please open a workspace first');
         return;
     }
-	
-	if (!fs.existsSync(path.join(workspaceFolder.uri.fsPath, '.git'))) {
-		vscode.window.showErrorMessage('The workspace is not a Git repository. Please initialize Git first.');
-		return;
-	}
-	
-	const configPath = path.join(workspaceFolder.uri.fsPath, CONFIG_FILE_NAME);
     
-	if (!fs.existsSync(configPath)) {
+    if (!fs.existsSync(path.join(workspaceFolder.uri.fsPath, '.git'))) {
+        vscode.window.showErrorMessage('The workspace is not a Git repository. Please initialize Git first.');
+        return;
+    }
+    
+    const configPath = path.join(workspaceFolder.uri.fsPath, CONFIG_FILE_NAME);
+    
+    if (!fs.existsSync(configPath)) {
         const config = {
-			"repoType": "local",    // Options: "github" or "local"
-			"authType": "password",
-			"gitToken": "",
-			"username": "username",
-			"password": "vcspassword",
-			"remoteRepo": "http://your.local.repo/path/to/repository.git",
-			"intervalMinutes": 60,
-			"branch": "master"
-		};
-		
+            "repoType": "local",
+            "authType": "password",
+            "gitToken": "",
+            "username": "username",
+            "password": "vcspassword",
+            "remoteRepo": "http://your.local.repo/path/to/repository.git",
+            "intervalMinutes": 60,
+            "branch": "master"
+        };
         
         fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
     }
@@ -62,15 +81,30 @@ async function initAutoPush() {
     const doc = await vscode.workspace.openTextDocument(configPath);
     await vscode.window.showTextDocument(doc);
 
-    addToGitIgnore(workspaceFolder.uri.fsPath);  // Add .autopush.json to .gitignore
+    addToGitIgnore(workspaceFolder.uri.fsPath);
 
-    fs.watchFile(configPath, async (curr, prev) => {
-        if (curr.mtime !== prev.mtime) {
-            await startAutoPush(configPath, workspaceFolder.uri.fsPath);
-        }
-    });
+    // Set up file watcher
+    setupFileWatcher(configPath, workspaceFolder.uri.fsPath);
 
     vscode.window.showInformationMessage('Please configure your Git credentials in the config file');
+}
+
+// Rest of your existing functions remain the same...
+function addToGitIgnore(workspacePath) {
+    // Your existing addToGitIgnore function
+    const gitIgnorePath = path.join(workspacePath, '.gitignore');
+    
+    if (fs.existsSync(gitIgnorePath)) {
+        const gitIgnoreContent = fs.readFileSync(gitIgnorePath, 'utf-8');
+        if (!gitIgnoreContent.includes('.autopush.json')) {
+            fs.appendFileSync(gitIgnorePath, '\n.autopush.json\n');
+            vscode.window.showInformationMessage('.autopush.json has been added to .gitignore');
+        }
+    } else {
+        const content = '.autopush.json\n';
+        fs.writeFileSync(gitIgnorePath, content);
+        vscode.window.showInformationMessage('.gitignore created and .autopush.json added');
+    }
 }
 
 async function startAutoPush(configPath, workspacePath) {
@@ -100,8 +134,10 @@ async function startAutoPush(configPath, workspacePath) {
             return;
         }
 
+        // Always clear existing interval before setting up a new one
         if (pushInterval) {
             clearInterval(pushInterval);
+            pushInterval = null;
         }
 
         const git = simpleGit(workspacePath);
@@ -113,11 +149,17 @@ async function startAutoPush(configPath, workspacePath) {
             await handleLocalRepository(git, config);
         }
 
-        // Schedule auto-push
+        // Validate interval minutes
+        const intervalMinutes = parseInt(config.intervalMinutes);
+        if (isNaN(intervalMinutes) || intervalMinutes <= 0) {
+            vscode.window.showErrorMessage('Invalid interval value. Please set a positive number of minutes.');
+            return;
+        }
+
+        // Set up new interval
         pushInterval = setInterval(async () => {
             try {
                 const status = await git.status();
-                // console.log(status)
                 if (status.modified.length > 0 || status.not_added.length > 0) {
                     await git.add('.');
                     await git.commit(`Auto-push: ${new Date().toISOString()}`);
@@ -127,12 +169,17 @@ async function startAutoPush(configPath, workspacePath) {
             } catch (error) {
                 vscode.window.showErrorMessage(`Auto-push failed: ${error.message}`);
             }
-        }, config.intervalMinutes * 60 * 1000);
+        }, intervalMinutes * 60 * 1000);
 
-        vscode.window.showInformationMessage(`Auto-push activated! Will push every ${config.intervalMinutes} minutes`);
+        vscode.window.showInformationMessage(`Auto-push reinitialized! Will push every ${intervalMinutes} minutes`);
 
     } catch (error) {
         vscode.window.showErrorMessage(`Failed to start auto-push: ${error.message}`);
+        // Clear interval on error
+        if (pushInterval) {
+            clearInterval(pushInterval);
+            pushInterval = null;
+        }
     }
 }
 
@@ -178,16 +225,32 @@ async function handleLocalRepository(git, config) {
 
 function deactivate() {
     if (pushInterval) {
-        clearInterval(pushInterval); // Stop auto-push interval
+        clearInterval(pushInterval);
         pushInterval = null;
-        vscode.window.showInformationMessage('Auto-push extension deactivated.');
     }
+    if (fileWatcher) {
+        fileWatcher.dispose();
+    }
+    vscode.window.showInformationMessage('Auto-push extension deactivated.');
 }
 
 module.exports = {
-    activate: (context) => {
+    activate: async (context) => {
         let disposable = vscode.commands.registerCommand('extension.initAutoPush', initAutoPush);
         context.subscriptions.push(disposable);
+
+        // Add to subscriptions so it gets cleaned up on deactivation
+        if (fileWatcher) {
+            context.subscriptions.push(fileWatcher);
+        }
+
+        context.subscriptions.push(
+            vscode.workspace.onDidChangeWorkspaceFolders(async () => {
+                await checkAndInitializeWorkspace();
+            })
+        );
+
+        await checkAndInitializeWorkspace();
     },
     deactivate
 };
